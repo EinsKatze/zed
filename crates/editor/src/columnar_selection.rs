@@ -5,7 +5,10 @@ use language::{Bias, LanguageAwareStyling, Point};
 use multi_buffer::{MBTextSummary, MultiBufferRow};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
-use crate::display_map::{DisplaySnapshot, FoldPoint, Highlights, TabPoint, ToDisplayPoint as _};
+use crate::{
+    DisplayPoint,
+    display_map::{DisplaySnapshot, FoldPoint, Highlights, TabPoint, ToDisplayPoint as _},
+};
 
 pub(crate) struct ColumnarSelectionRows<'a> {
     snapshot: &'a DisplaySnapshot,
@@ -79,17 +82,30 @@ impl<'a> ColumnarSelectionRows<'a> {
                 continue;
             }
             let point = tabs.tab_point_to_point(tab_point, Bias::Left);
+            let display_point = point.to_display_point(self.snapshot);
+            let hidden = self.snapshot.is_block_line(display_point.row());
             let canonical = tabs.point_to_tab_point(point, Bias::Left);
-            if self.buffer_row(point.row).is_boundary(point.column)
+            if !hidden
                 && canonical == tab_point
-                && point
-                    .to_display_point(self.snapshot)
-                    .to_point(self.snapshot)
-                    == point
+                && self.buffer_row(point.row).is_boundary(point.column)
             {
                 return Some(point);
             }
-            let preceding = if canonical < tab_point {
+            let preceding = if hidden && canonical == tab_point {
+                let hidden_start = self.snapshot.display_point_to_fold_point(
+                    DisplayPoint::new(display_point.row(), 0),
+                    Bias::Left,
+                );
+                let hidden_start = tabs.fold_point_to_tab_point(hidden_start);
+                if hidden_start.row() != row {
+                    return None;
+                }
+                if hidden_start < tab_point {
+                    hidden_start
+                } else {
+                    TabPoint::new(row, hidden_start.column().checked_sub(1)?)
+                }
+            } else if canonical < tab_point {
                 canonical
             } else {
                 let previous = if let Some(byte) = point.column.checked_sub(1) {
@@ -247,6 +263,7 @@ impl<'a> ColumnBoundaries<'a> {
 mod tests {
     use super::*;
     use crate::{
+        DisplayRow,
         display_map::{
             BlockPlacement, BlockProperties, BlockStyle, Crease, DisplayMap, FoldPlaceholder,
         },
@@ -546,7 +563,7 @@ mod tests {
         assert_eq!(query.points_for_row(2, &(0..0)), None);
         assert_eq!(query.points_for_row(2, &(0..u32::MAX)), None);
         let rebuilt = state.build_map(cx).update(cx, |map, cx| map.snapshot(cx));
-        check_snapshot(&snapshot, &rebuilt, None, 4, &mut rng, 0);
+        check_snapshot(&snapshot, &rebuilt, true, None, 4, &mut rng, 0);
     }
 
     #[gpui::test]
@@ -717,6 +734,7 @@ mod tests {
         check_snapshot(
             &snapshot,
             &snapshot,
+            true,
             Some(&texts.join("\n")),
             4,
             &mut rng,
@@ -732,6 +750,7 @@ mod tests {
                 state.block,
                 state.wrap_width
             );
+            let replaced_before = state.replaces_rows();
             match kind {
                 0 => {
                     let index = rng.random_range(0..buffers.len());
@@ -791,6 +810,10 @@ mod tests {
                         map.update(cx, |map, cx| {
                             map.unfold_intersecting([Anchor::Min..Anchor::Max], true, cx)
                         });
+                        if state.replaces_rows() {
+                            block_ids.clear();
+                            state.block = None;
+                        }
                     }
                 }
                 3 | 6 => {
@@ -837,13 +860,22 @@ mod tests {
                     } else {
                         let text = snapshot.buffer_snapshot().text();
                         let boundaries = scalar_boundaries(&text);
-                        let offset =
-                            MultiBufferOffset(boundaries[rng.random_range(0..boundaries.len())]);
-                        state.block = Some((
-                            snapshot.buffer_snapshot().anchor_after(offset),
-                            rng.random(),
-                            rng.random_range(1..=3),
-                        ));
+                        let start = rng.random_range(0..boundaries.len());
+                        let buffer = snapshot.buffer_snapshot();
+                        let position = buffer.anchor_after(MultiBufferOffset(boundaries[start]));
+                        let placement = match rng.random_range(0..3) {
+                            0 => BlockPlacement::Above(position),
+                            1 => BlockPlacement::Below(position),
+                            _ => {
+                                let start = rng.random_range(0..boundaries.len() - 1);
+                                let end = rng.random_range(start + 1..boundaries.len());
+                                BlockPlacement::Replace(
+                                    buffer.anchor_before(MultiBufferOffset(boundaries[start]))
+                                        ..=buffer.anchor_after(MultiBufferOffset(boundaries[end])),
+                                )
+                            }
+                        };
+                        state.block = Some((placement, rng.random_range(1..=3)));
                         block_ids.extend(map.update(cx, |map, cx| {
                             map.insert_blocks([state.block_properties().expect("block")], cx)
                         }));
@@ -867,21 +899,24 @@ mod tests {
                 && state
                     .inlays
                     .iter()
-                    .all(|inlay| !inlay.position.is_valid(snapshot.buffer_snapshot())))
+                    .all(|inlay| !inlay.position.is_valid(snapshot.buffer_snapshot()))
+                && !state.replaces_rows())
             .then_some(text.as_str());
             let rebuilt = state.build_map(cx).update(cx, |map, cx| map.snapshot(cx));
             check_snapshot(
                 &snapshot,
                 &rebuilt,
+                blocks_agree(&snapshot, &rebuilt),
                 plain,
                 state.tab_size,
                 &mut rng,
                 operation,
             );
-            if kind == 4 || kind == 5 {
+            if (kind == 4 || kind == 5) && !replaced_before && !state.replaces_rows() {
                 check_snapshot(
                     &snapshot,
                     &previous,
+                    true,
                     plain,
                     state.tab_size,
                     &mut rng,
@@ -893,6 +928,7 @@ mod tests {
             check_snapshot(
                 &settled,
                 &rebuilt,
+                blocks_agree(&settled, &rebuilt),
                 plain,
                 state.tab_size,
                 &mut rng,
@@ -907,7 +943,7 @@ mod tests {
         tab_size: u32,
         folds: Vec<Range<Anchor>>,
         inlays: Vec<Inlay>,
-        block: Option<(Anchor, bool, u32)>,
+        block: Option<(BlockPlacement<Anchor>, u32)>,
         wrap_width: Option<Pixels>,
     }
 
@@ -954,18 +990,20 @@ mod tests {
             })
         }
 
+        fn replaces_rows(&self) -> bool {
+            matches!(self.block, Some((BlockPlacement::Replace(_), _)))
+        }
+
         fn block_properties(&self) -> Option<BlockProperties<Anchor>> {
-            self.block.map(|(position, above, height)| BlockProperties {
-                placement: if above {
-                    BlockPlacement::Above(position)
-                } else {
-                    BlockPlacement::Below(position)
-                },
-                style: BlockStyle::Fixed,
-                height: Some(height),
-                render: Arc::new(|_| div().into_any()),
-                priority: 0,
-            })
+            self.block
+                .as_ref()
+                .map(|(placement, height)| BlockProperties {
+                    placement: placement.clone(),
+                    style: BlockStyle::Fixed,
+                    height: Some(*height),
+                    render: Arc::new(|_| div().into_any()),
+                    priority: 0,
+                })
         }
     }
 
@@ -974,6 +1012,15 @@ mod tests {
         len: u32,
         columns: Vec<(u32, u32)>,
         points: Vec<(u32, u32)>,
+    }
+
+    fn blocks_agree(snapshot: &DisplaySnapshot, rebuilt: &DisplaySnapshot) -> bool {
+        let block_rows = |snapshot: &DisplaySnapshot| {
+            (0..=snapshot.max_point().row().0)
+                .map(|row| snapshot.is_block_line(DisplayRow(row)))
+                .collect::<Vec<_>>()
+        };
+        block_rows(snapshot) == block_rows(rebuilt)
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1163,6 +1210,7 @@ mod tests {
     fn check_snapshot(
         snapshot: &DisplaySnapshot,
         rebuilt: &DisplaySnapshot,
+        blocks_agree: bool,
         plain: Option<&str>,
         tab_size: u32,
         rng: &mut StdRng,
@@ -1286,9 +1334,11 @@ mod tests {
                     let tab = snapshot
                         .tab_snapshot()
                         .point_to_tab_point(point, Bias::Left);
+                    let display = point.to_display_point(snapshot);
                     if tab.row() as usize != row
                         || snapshot.tab_snapshot().tab_point_to_point(tab, Bias::Left) != point
-                        || point.to_display_point(snapshot).to_point(snapshot) != point
+                        || display.to_point(snapshot) != point
+                        || snapshot.is_block_line(display.row())
                     {
                         return None;
                     }
@@ -1310,11 +1360,13 @@ mod tests {
                 u32::MAX..u32::MAX,
             ] {
                 let points = query.points_for_row(row as u32, &columns);
-                assert_eq!(
-                    points,
-                    rebuilt_query.points_for_row(row as u32, &columns),
-                    "operation {operation}: row {row}, columns {columns:?}"
-                );
+                if blocks_agree {
+                    assert_eq!(
+                        points,
+                        rebuilt_query.points_for_row(row as u32, &columns),
+                        "operation {operation}: row {row}, columns {columns:?}"
+                    );
+                }
                 if let Some(expected) = &expected {
                     assert_eq!(
                         points,

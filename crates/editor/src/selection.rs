@@ -1996,24 +1996,6 @@ impl Editor {
         {
             self.add_selections_state = None;
         }
-        let mut columnar_rows = ColumnarSelectionRows::new(&display_map);
-        let (mut columnar_selections, new_selections_to_columnarize) = {
-            if let Some(state) = self.add_selections_state.as_ref() {
-                let columnar_selection_ids: HashSet<_> = state
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.stack.iter())
-                    .copied()
-                    .collect();
-
-                all_selections
-                    .into_iter()
-                    .partition(|s| columnar_selection_ids.contains(&s.id))
-            } else {
-                (Vec::new(), all_selections)
-            }
-        };
-
         let mut state = self
             .add_selections_state
             .take()
@@ -2021,6 +2003,25 @@ impl Editor {
                 groups: Vec::new(),
                 skip_soft_wrap,
             });
+        let live_selection_ids = all_selections
+            .iter()
+            .map(|selection| selection.id)
+            .collect::<HashSet<_>>();
+        state.groups.retain_mut(|group| {
+            group.stack.retain(|id| live_selection_ids.contains(id));
+            !group.stack.is_empty() && (skip_soft_wrap || group.stack.len() > 1)
+        });
+        let columnar_selection_ids = state
+            .groups
+            .iter()
+            .flat_map(|group| group.stack.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut columnar_rows = ColumnarSelectionRows::new(&display_map);
+        let (mut columnar_selections, new_selections_to_columnarize) =
+            all_selections
+                .into_iter()
+                .partition::<Vec<_>, _>(|selection| columnar_selection_ids.contains(&selection.id));
 
         for selection in new_selections_to_columnarize {
             if skip_soft_wrap {
@@ -2109,7 +2110,6 @@ impl Editor {
                 .collect::<HashMap<_, _>>();
             let mut map = HashMap::default();
             for group in &mut state.groups {
-                group.stack.retain(|id| selections_by_id.contains_key(id));
                 let Some(oldest_selection) =
                     group.stack.first().and_then(|id| selections_by_id.get(id))
                 else {
@@ -2146,10 +2146,6 @@ impl Editor {
                     group.above = above;
                 }
                 if above == group.above {
-                    let range = selection.display_range(&display_map).sorted();
-                    debug_assert!(skip_soft_wrap || range.start.row() == range.end.row());
-                    let row = range.start.row();
-
                     let maybe_new_selection = if skip_soft_wrap {
                         let goal_columns = goal_columns_by_selection_id
                             .remove(&selection.id)
@@ -2162,6 +2158,12 @@ impl Editor {
                             &goal_columns,
                         )
                     } else {
+                        let range = selection.display_range(&display_map).sorted();
+                        let row = if above {
+                            range.start.row()
+                        } else {
+                            range.end.row()
+                        };
                         let positions =
                             if let SelectionGoal::HorizontalRange { start, end } = selection.goal {
                                 Pixels::from(start)..Pixels::from(end)
@@ -2203,9 +2205,6 @@ impl Editor {
             }
         }
 
-        if final_selections.is_empty() {
-            return;
-        }
         self.change_selections_with_history(
             SelectionEffects::default(),
             history_entry,

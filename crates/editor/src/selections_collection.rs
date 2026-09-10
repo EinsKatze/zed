@@ -414,6 +414,9 @@ impl SelectionsCollection {
         reversed: bool,
         text_layout_details: &TextLayoutDetails,
     ) -> Option<Selection<Point>> {
+        if display_map.is_block_line(row) {
+            return None;
+        }
         let is_empty = positions.start == positions.end;
         let line_len = display_map.line_len(row);
         let line = display_map.layout_row(row, text_layout_details);
@@ -524,11 +527,7 @@ impl SelectionsCollection {
                 goal_columns,
                 selection.reversed,
             ) {
-                if (above && candidate.start < selection.start)
-                    || (!above && candidate.end > selection.end)
-                {
-                    return Some(candidate);
-                }
+                return Some(candidate);
             }
         }
     }
